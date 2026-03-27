@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Runtime data
+telegram_bot_data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local editor/OS files
+.DS_Store
+.vscode/
+.idea/
