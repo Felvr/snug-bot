@@ -349,6 +349,7 @@ def _process_document_job(
     document: dict[str, Any],
     cancel_event: threading.Event,
     progress_state: dict[str, Any],
+    job_id: str,
 ) -> dict[str, Any]:
     file_name = document.get("file_name") or "upload.bin"
     suffix = Path(file_name).suffix.lower()
@@ -363,7 +364,7 @@ def _process_document_job(
     incoming_dir = base_dir / "incoming"
     incoming_dir.mkdir(parents=True, exist_ok=True)
 
-    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку.")
+    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку. job={job_id}, instance={INSTANCE_ID}")
     _safe_notify(api, chat_id, "Скачиваю файл из Telegram в локальную рабочую папку.")
 
     telegram_file_path = api.get_file_path(document["file_id"])
@@ -391,7 +392,7 @@ def _process_document_job(
     )
 
     try:
-        _safe_notify(api, chat_id, "Запускаю обработку в pipeline. Это может занять несколько минут.")
+        _safe_notify(api, chat_id, f"Запускаю обработку в pipeline. Это может занять несколько минут. job={job_id}")
         result = process_input_file(
             local_input_path,
             output_root=base_dir,
@@ -438,7 +439,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
 
     def worker() -> None:
         try:
-            result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"])
+            result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"], job_id)
             cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
             _set_last_job(
                 chat_id,
