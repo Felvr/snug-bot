@@ -31,6 +31,10 @@ NETWORK_ERROR_TYPES = (
 )
 
 
+ACTIVE_JOBS: dict[int, dict[str, Any]] = {}
+ACTIVE_JOBS_LOCK = threading.Lock()
+
+
 class TelegramBotAPI:
     def __init__(self, token: str):
         self.token = token
@@ -216,6 +220,7 @@ def _support_message() -> str:
     return (
         "Пришлите PDF, CSV или XLSX с прайсом.\n"
         "Бот запустит текущий SNUG pipeline и вернёт готовый catalog_product.csv для выгрузки на сайт."
+        "\nКоманды: /status, /stop"
         f"\nПоддерживаемые форматы: {formats}"
     )
 
@@ -227,26 +232,54 @@ def _status_message() -> str:
         or os.getenv("OPENAI_API_KEY", "").strip()
     )
     data_dir = resolve_data_dir()
+    with ACTIVE_JOBS_LOCK:
+        active_job_count = sum(1 for state in ACTIVE_JOBS.values() if state.get("thread") and state["thread"].is_alive())
     return (
         f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
         f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
         f"SNUG_BOT_DATA_DIR: {data_dir}\n"
         f"SNUG_PIPELINE_TWO_PHASE: {os.getenv('SNUG_PIPELINE_TWO_PHASE', '1')}\n"
         f"SNUG_PIPELINE_PAGE_STRATEGY: {os.getenv('SNUG_PIPELINE_PAGE_STRATEGY', 'all')}\n"
-        f"SNUG_PIPELINE_ROUTING_STRATEGY: {os.getenv('SNUG_PIPELINE_ROUTING_STRATEGY', 'all')}"
+        f"SNUG_PIPELINE_ROUTING_STRATEGY: {os.getenv('SNUG_PIPELINE_ROUTING_STRATEGY', 'all')}\n"
+        f"Active jobs: {active_job_count}"
     )
 
 
 def _summary_caption(result: dict[str, Any]) -> str:
     summary = result["summary"]
-    catalog_path = Path(result["catalog_product_csv"])
+    catalog_csv = str(result.get("catalog_product_csv", "") or "").strip()
+    catalog_name = Path(catalog_csv).name if catalog_csv else "catalog_product.csv"
     clean_rows = summary.get("clean_rows", "")
     price_nonzero = summary.get("price_nonzero", "")
     mode = summary.get("mode", "")
+    cancelled = int(summary.get("cancelled", result.get("cancelled", 0)))
+    status = "Остановлено" if cancelled else "Готово"
     return (
-        f"Готово: {catalog_path.name}\n"
+        f"{status}: {catalog_name}\n"
         f"mode={mode}, rows={clean_rows}, price_nonzero={price_nonzero}"
     )
+
+
+def _get_active_job(chat_id: int) -> dict[str, Any] | None:
+    with ACTIVE_JOBS_LOCK:
+        state = ACTIVE_JOBS.get(chat_id)
+        if not state:
+            return None
+        thread = state.get("thread")
+        if thread is not None and thread.is_alive():
+            return state
+        ACTIVE_JOBS.pop(chat_id, None)
+    return None
+
+
+def _set_active_job(chat_id: int, state: dict[str, Any]) -> None:
+    with ACTIVE_JOBS_LOCK:
+        ACTIVE_JOBS[chat_id] = state
+
+
+def _clear_active_job(chat_id: int) -> None:
+    with ACTIVE_JOBS_LOCK:
+        ACTIVE_JOBS.pop(chat_id, None)
 
 
 def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
@@ -255,12 +288,35 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
         api.send_message(chat_id, _support_message())
         return
     if command == "/status":
-        api.send_message(chat_id, _status_message())
+        active = _get_active_job(chat_id)
+        if active:
+            stage = active.get("progress_state", {}).get("last_stage_text", "обработка")
+            api.send_message(chat_id, f"{_status_message()}\nТекущая задача: выполняется ({stage}).")
+        else:
+            api.send_message(chat_id, _status_message())
+        return
+    if command in {"/stop", "/cancel"}:
+        active = _get_active_job(chat_id)
+        if not active:
+            api.send_message(chat_id, "Сейчас нет активной обработки для остановки.")
+            return
+        cancel_event = active.get("cancel_event")
+        if cancel_event is None:
+            api.send_message(chat_id, "Не удалось остановить задачу: внутреннее состояние недоступно.")
+            return
+        cancel_event.set()
+        api.send_message(chat_id, "Принял /stop. Останавливаю обработку и подготовлю доступные результаты.")
         return
     api.send_message(chat_id, _support_message())
 
 
-def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]) -> None:
+def _process_document_job(
+    api: TelegramBotAPI,
+    chat_id: int,
+    document: dict[str, Any],
+    cancel_event: threading.Event,
+    progress_state: dict[str, Any],
+) -> None:
     file_name = document.get("file_name") or "upload.bin"
     suffix = Path(file_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
@@ -284,10 +340,8 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
     _safe_notify(api, chat_id, f"Файл скачан: {local_input_path.name}. Передаю его в pipeline.")
 
     heartbeat_interval_sec = int_from_env("SNUG_BOT_PROGRESS_INTERVAL_SEC", 45)
-    progress_state: dict[str, Any] = {
-        "started_at": time.monotonic(),
-        "last_stage_text": "подготовка обработки",
-    }
+    progress_state["started_at"] = time.monotonic()
+    progress_state["last_stage_text"] = "подготовка обработки"
 
     def progress_callback(stage: str, message: str) -> None:
         formatted = _progress_message(stage, message)
@@ -306,19 +360,57 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
             local_input_path,
             output_root=base_dir,
             progress_callback=progress_callback,
+            stop_requested=cancel_event.is_set,
         )
     finally:
         stop_event.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1)
 
-    _safe_notify(api, chat_id, "Отправляю готовый catalog_product.csv.")
-    _safe_send_document(api, chat_id, Path(result["catalog_product_csv"]), caption=_summary_caption(result))
+    cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
+    if cancelled:
+        _safe_notify(api, chat_id, "Обработка остановлена по запросу. Отправляю всё, что успело сохраниться.")
+    else:
+        _safe_notify(api, chat_id, "Отправляю готовый catalog_product.csv.")
+
+    catalog_csv = str(result.get("catalog_product_csv", "") or "").strip()
+    if catalog_csv and Path(catalog_csv).exists():
+        _safe_send_document(api, chat_id, Path(catalog_csv), caption=_summary_caption(result))
+    else:
+        _safe_notify(api, chat_id, "Итоговый catalog_product.csv на текущем этапе отсутствует.")
 
     archive_path = Path(result["artifacts_zip"])
     if archive_path.exists():
         _safe_notify(api, chat_id, "Отправляю архив с промежуточными файлами и summary.")
         _safe_send_document(api, chat_id, archive_path, caption="Дополнительно отправляю архив со всеми артефактами обработки.")
+
+
+def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]) -> None:
+    if _get_active_job(chat_id):
+        _safe_notify(api, chat_id, "У вас уже идет обработка. Дождитесь завершения или отправьте /stop.")
+        return
+
+    cancel_event = threading.Event()
+    state: dict[str, Any] = {
+        "cancel_event": cancel_event,
+        "progress_state": {"last_stage_text": "ожидание запуска"},
+    }
+
+    def worker() -> None:
+        try:
+            _process_document_job(api, chat_id, document, cancel_event, state["progress_state"])
+        except ProcessingError as exc:
+            _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
+        except Exception as exc:
+            traceback.print_exc()
+            _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
+        finally:
+            _clear_active_job(chat_id)
+
+    thread = threading.Thread(target=worker, name=f"snug-bot-job-{chat_id}", daemon=True)
+    state["thread"] = thread
+    _set_active_job(chat_id, state)
+    thread.start()
 
 
 def handle_update(api: TelegramBotAPI, update: dict[str, Any]) -> None:
@@ -335,13 +427,7 @@ def handle_update(api: TelegramBotAPI, update: dict[str, Any]) -> None:
 
     document = message.get("document")
     if document:
-        try:
-            _handle_document(api, chat_id, document)
-        except ProcessingError as exc:
-            _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
-        except Exception as exc:
-            traceback.print_exc()
-            _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
+        _handle_document(api, chat_id, document)
         return
 
     api.send_message(chat_id, _support_message())

@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 from pdf2image import convert_from_path
@@ -775,6 +775,15 @@ def render_pages(pdf_path: str | Path, page_numbers: list[int], dpi: int = DEFAU
     return rendered
 
 
+def _stop_requested(should_stop: Callable[[], bool] | None) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
 def route_pdf_pages(
     pdf_path: str | Path,
     *,
@@ -784,7 +793,8 @@ def route_pdf_pages(
     start_page: int = 10,
     explicit_pages: list[int] | None = None,
     dpi: int = 120,
-) -> list[RoutedPage]:
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[list[RoutedPage], bool]:
     pdf_path = Path(pdf_path)
     try:
         import pdfplumber
@@ -801,10 +811,14 @@ def route_pdf_pages(
         explicit_pages=explicit_pages,
     )
     routed: list[RoutedPage] = []
+    cancelled = False
     for page_num, image in render_pages(pdf_path, selected_pages, dpi=dpi):
+        if _stop_requested(should_stop):
+            cancelled = True
+            break
         category = client.classify_page(image, page_num)
         routed.append(RoutedPage(page_num=page_num, category=category))
-    return routed
+    return routed, cancelled
 
 
 def extract_pdf_records(
@@ -816,7 +830,8 @@ def extract_pdf_records(
     start_page: int = 1,
     explicit_pages: list[int] | None = None,
     dpi: int = DEFAULT_DPI,
-) -> pd.DataFrame:
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[pd.DataFrame, bool]:
     pdf_path = Path(pdf_path)
     try:
         import pdfplumber
@@ -833,7 +848,11 @@ def extract_pdf_records(
         explicit_pages=explicit_pages,
     )
     rows: list[dict[str, Any]] = []
+    cancelled = False
     for page_num, image in render_pages(pdf_path, selected_pages, dpi=dpi):
+        if _stop_requested(should_stop):
+            cancelled = True
+            break
         category = client.classify_page(image, page_num)
         if category == "Skip":
             continue
@@ -848,7 +867,7 @@ def extract_pdf_records(
             )
             if normalized:
                 rows.append(normalized)
-    return pd.DataFrame(dedupe_records(rows))
+    return pd.DataFrame(dedupe_records(rows)), cancelled
 
 
 def extract_pdf_records_two_phase(
@@ -861,9 +880,10 @@ def extract_pdf_records_two_phase(
     routing_explicit_pages: list[int] | None = None,
     routing_dpi: int = 120,
     extraction_dpi: int = DEFAULT_DPI,
-) -> tuple[pd.DataFrame, list[RoutedPage]]:
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[pd.DataFrame, list[RoutedPage], bool]:
     pdf_path = Path(pdf_path)
-    routed_pages = route_pdf_pages(
+    routed_pages, cancelled = route_pdf_pages(
         pdf_path,
         client=client,
         page_strategy=routing_strategy,
@@ -871,11 +891,17 @@ def extract_pdf_records_two_phase(
         start_page=routing_start_page,
         explicit_pages=routing_explicit_pages,
         dpi=routing_dpi,
+        should_stop=should_stop,
     )
+    if cancelled:
+        return pd.DataFrame(columns=[]), routed_pages, True
     extraction_targets = [page.page_num for page in routed_pages if page.category != "Skip"]
     category_by_page = {page.page_num: ("Generic" if page.category == "Other" else page.category) for page in routed_pages}
     rows: list[dict[str, Any]] = []
     for page_num, image in render_pages(pdf_path, extraction_targets, dpi=extraction_dpi):
+        if _stop_requested(should_stop):
+            cancelled = True
+            break
         category = category_by_page.get(page_num, "Generic")
         items = client.extract_page_items(image, category)
         for item in items:
@@ -888,7 +914,7 @@ def extract_pdf_records_two_phase(
             )
             if normalized:
                 rows.append(normalized)
-    return pd.DataFrame(dedupe_records(rows)), routed_pages
+    return pd.DataFrame(dedupe_records(rows)), routed_pages, cancelled
 
 
 def summarise_cleaned(df: pd.DataFrame) -> dict[str, int]:
@@ -918,12 +944,14 @@ def process_single_pdf(
     routing_start_page: int = 1,
     routing_explicit_pages: list[int] | None = None,
     routing_dpi: int = 120,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     pdf_path = Path(pdf_path)
     started = time.time()
     routed_pages: list[RoutedPage] = []
+    cancelled = False
     if two_phase:
-        raw_df, routed_pages = extract_pdf_records_two_phase(
+        raw_df, routed_pages, cancelled = extract_pdf_records_two_phase(
             pdf_path,
             client=client,
             routing_strategy=routing_strategy,
@@ -932,9 +960,10 @@ def process_single_pdf(
             routing_explicit_pages=routing_explicit_pages or explicit_pages,
             routing_dpi=routing_dpi,
             extraction_dpi=dpi,
+            should_stop=should_stop,
         )
     else:
-        raw_df = extract_pdf_records(
+        raw_df, cancelled = extract_pdf_records(
             pdf_path,
             client=client,
             page_strategy=page_strategy,
@@ -942,6 +971,7 @@ def process_single_pdf(
             start_page=start_page,
             explicit_pages=explicit_pages,
             dpi=dpi,
+            should_stop=should_stop,
         )
     raw_df = unify_brand_per_pdf(raw_df) if not raw_df.empty else raw_df.copy()
     clean_df = clean_furniture_catalog(raw_df) if not raw_df.empty else raw_df.copy()
@@ -962,6 +992,7 @@ def process_single_pdf(
         result["routed_pages"] = len(routed_pages)
         result["product_like_pages"] = int(sum(page.category != "Skip" for page in routed_pages))
     result.update(summarise_cleaned(clean_df))
+    result["cancelled"] = int(cancelled)
 
     if output_dir:
         out_dir = Path(output_dir)

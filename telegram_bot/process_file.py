@@ -25,11 +25,21 @@ class ProcessingError(RuntimeError):
 
 
 ProgressCallback = Callable[[str, str], None]
+StopRequestedCallback = Callable[[], bool]
 
 
 def _notify(progress_callback: ProgressCallback | None, stage: str, message: str) -> None:
     if progress_callback is not None:
         progress_callback(stage, message)
+
+
+def _stop_requested(stop_requested: StopRequestedCallback | None) -> bool:
+    if stop_requested is None:
+        return False
+    try:
+        return bool(stop_requested())
+    except Exception:
+        return False
 
 
 def _load_pipeline_module():
@@ -83,6 +93,7 @@ def _process_pdf(
     input_path: Path,
     output_dir: Path,
     progress_callback: ProgressCallback | None = None,
+    stop_requested: StopRequestedCallback | None = None,
 ) -> dict[str, Any]:
     _notify(progress_callback, "pdf_prepare", "Готовлю PDF-пайплайн и проверяю зависимости.")
     pipeline = _load_pipeline_module()
@@ -101,6 +112,7 @@ def _process_pdf(
         input_path,
         client=client,
         output_dir=output_dir,
+        should_stop=stop_requested,
         **_pipeline_kwargs(pipeline),
     )
     pd.DataFrame([result]).to_csv(output_dir / "batch_summary.csv", index=False)
@@ -123,13 +135,54 @@ def _process_table(
     input_path: Path,
     output_dir: Path,
     progress_callback: ProgressCallback | None = None,
+    stop_requested: StopRequestedCallback | None = None,
 ) -> dict[str, Any]:
     _notify(progress_callback, "table_prepare", "Открываю таблицу и готовлю постобработку.")
     pipeline = _load_pipeline_module()
     from arxiv.furniture_postprocess import clean_furniture_catalog
 
+    if _stop_requested(stop_requested):
+        _notify(progress_callback, "table_done", "Остановка запрошена до начала обработки таблицы.")
+        empty_result = {
+            "pdf_name": input_path.name,
+            "mode": "table_cleanup",
+            "raw_rows": 0,
+            "clean_rows": 0,
+            "price_nonzero": 0,
+            "needs_review": 0,
+            "imputed": 0,
+            "elapsed_sec": 0,
+            "raw_csv": "",
+            "clean_csv": "",
+            "catalog_product_csv": "",
+            "cancelled": 1,
+        }
+        pd.DataFrame([empty_result]).to_csv(output_dir / "batch_summary.csv", index=False)
+        return empty_result
+
     _notify(progress_callback, "table_read", "Читаю входную таблицу.")
     raw_df = _load_tabular_file(input_path)
+    if _stop_requested(stop_requested):
+        _notify(progress_callback, "table_done", "Остановка запрошена. Возвращаю частичный результат.")
+        raw_path = output_dir / f"{input_path.stem}__raw.csv"
+        raw_df.to_csv(raw_path, index=False)
+        empty_result = {
+            "pdf_name": input_path.name,
+            "mode": "table_cleanup",
+            "raw_rows": len(raw_df),
+            "clean_rows": 0,
+            "price_nonzero": 0,
+            "needs_review": 0,
+            "imputed": 0,
+            "elapsed_sec": 0,
+            "raw_csv": str(raw_path),
+            "clean_csv": "",
+            "catalog_product_csv": "",
+            "cancelled": 1,
+        }
+        pd.DataFrame([empty_result]).to_csv(output_dir / "batch_summary.csv", index=False)
+        return empty_result
+
     _notify(progress_callback, "table_clean", "Очищаю и нормализую данные.")
     clean_df = clean_furniture_catalog(raw_df)
     _notify(progress_callback, "table_export", "Собираю итоговый catalog_product.csv.")
@@ -155,6 +208,7 @@ def _process_table(
         "raw_csv": str(raw_path),
         "clean_csv": str(clean_path),
         "catalog_product_csv": str(export_path),
+        "cancelled": 0,
     }
     pd.DataFrame([result]).to_csv(output_dir / "batch_summary.csv", index=False)
     _notify(
@@ -177,6 +231,7 @@ def process_input_file(
     input_path: str | Path,
     output_root: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
+    stop_requested: StopRequestedCallback | None = None,
 ) -> dict[str, Any]:
     load_env_file()
     source_path = Path(input_path).expanduser().resolve()
@@ -200,23 +255,41 @@ def process_input_file(
     job_input_path = _copy_to_job_input(source_path, input_dir)
     _notify(progress_callback, "job_detect_type", f"Определил формат файла: {suffix}.")
     if suffix == ".pdf":
-        result = _process_pdf(job_input_path, output_dir, progress_callback=progress_callback)
+        result = _process_pdf(
+            job_input_path,
+            output_dir,
+            progress_callback=progress_callback,
+            stop_requested=stop_requested,
+        )
     else:
-        result = _process_table(job_input_path, output_dir, progress_callback=progress_callback)
+        result = _process_table(
+            job_input_path,
+            output_dir,
+            progress_callback=progress_callback,
+            stop_requested=stop_requested,
+        )
 
     _notify(progress_callback, "job_archive", "Упаковываю вспомогательные файлы в архив.")
     archive_path = _zip_output_dir(output_dir, job_dir / "artifacts.zip")
-    catalog_path = Path(result["catalog_product_csv"]).resolve()
-    clean_path = Path(result["clean_csv"]).resolve()
-    _notify(progress_callback, "job_done", f"Обработка завершена. Готов файл {catalog_path.name}.")
+    catalog_csv = str(result.get("catalog_product_csv", "") or "").strip()
+    clean_csv = str(result.get("clean_csv", "") or "").strip()
+    catalog_path = Path(catalog_csv).resolve() if catalog_csv else None
+    clean_path = Path(clean_csv).resolve() if clean_csv else None
+    if int(result.get("cancelled", 0)):
+        _notify(progress_callback, "job_done", "Обработка остановлена по запросу. Сохранил доступные результаты.")
+    elif catalog_path is not None:
+        _notify(progress_callback, "job_done", f"Обработка завершена. Готов файл {catalog_path.name}.")
+    else:
+        _notify(progress_callback, "job_done", "Обработка завершена без итогового catalog_product.csv.")
 
     return {
         "job_dir": str(job_dir.resolve()),
         "input_file": str(job_input_path.resolve()),
         "output_dir": str(output_dir.resolve()),
-        "catalog_product_csv": str(catalog_path),
-        "clean_csv": str(clean_path),
+        "catalog_product_csv": str(catalog_path) if catalog_path is not None else "",
+        "clean_csv": str(clean_path) if clean_path is not None else "",
         "artifacts_zip": str(archive_path.resolve()),
+        "cancelled": int(result.get("cancelled", 0)),
         "summary": result,
     }
 
