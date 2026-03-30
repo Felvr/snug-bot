@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_PATH = ROOT_DIR / ".env"
+FALLBACK_DATA_DIR = Path("/tmp/snug_bot_data")
 
 
 def load_env_file(env_path: Path | None = None) -> Path:
@@ -49,3 +50,24 @@ def int_from_env(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def resolve_data_dir(env_var: str = "SNUG_BOT_DATA_DIR") -> Path:
+    raw_value = os.getenv(env_var, "").strip()
+    if raw_value in {"data", "./data", "app/data", "./app/data"}:
+        raw_value = "/app/data"
+    base_dir = Path(raw_value) if raw_value else ROOT_DIR / "telegram_bot_data"
+    base_dir = base_dir.expanduser()
+
+    if not base_dir.is_absolute():
+        base_dir = (Path.cwd() / base_dir).resolve()
+
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        probe_path = base_dir / ".write_test"
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+        return base_dir
+    except (PermissionError, OSError):
+        FALLBACK_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return FALLBACK_DATA_DIR

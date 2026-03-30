@@ -37,9 +37,11 @@ docker build -t snug-bot:latest .
 docker run --rm \
 	-e TELEGRAM_BOT_TOKEN=... \
 	-e OPENROUTER_API_KEY=... \
-	-e SNUG_BOT_DATA_DIR=./telegram_bot_data \
+	-e SNUG_BOT_DATA_DIR=/app/data \
 	snug-bot:latest
 ```
+
+Если команда сборки без точки в конце, Docker вернет ошибку. Нужен именно контекст сборки `.`.
 
 ## Деплой на GitHub
 
@@ -81,7 +83,7 @@ git push -u origin main
 ```dotenv
 TELEGRAM_BOT_TOKEN=...
 OPENROUTER_API_KEY=...
-SNUG_BOT_DATA_DIR=./telegram_bot_data
+SNUG_BOT_DATA_DIR=/app/data
 SNUG_BOT_POLL_TIMEOUT=30
 SNUG_BOT_RETRY_DELAY_SEC=5
 SNUG_BOT_PROGRESS_INTERVAL_SEC=45

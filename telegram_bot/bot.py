@@ -17,7 +17,7 @@ from typing import Any
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from telegram_bot.common import ROOT_DIR, int_from_env, load_env_file, sanitize_stem
+from telegram_bot.common import ROOT_DIR, int_from_env, load_env_file, resolve_data_dir, sanitize_stem
 from telegram_bot.process_file import ProcessingError, SUPPORTED_EXTENSIONS, process_input_file
 
 
@@ -226,7 +226,7 @@ def _status_message() -> str:
         or os.getenv("OPENROUTER_API_KEY", "").strip()
         or os.getenv("OPENAI_API_KEY", "").strip()
     )
-    data_dir = Path(os.getenv("SNUG_BOT_DATA_DIR", ROOT_DIR / "telegram_bot_data")).expanduser()
+    data_dir = resolve_data_dir()
     return (
         f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
         f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
@@ -270,7 +270,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
         )
         return
 
-    base_dir = Path(os.getenv("SNUG_BOT_DATA_DIR", ROOT_DIR / "telegram_bot_data")).expanduser()
+    base_dir = resolve_data_dir()
     incoming_dir = base_dir / "incoming"
     incoming_dir.mkdir(parents=True, exist_ok=True)
 

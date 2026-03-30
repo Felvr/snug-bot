@@ -14,7 +14,7 @@ import pandas as pd
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from telegram_bot.common import ROOT_DIR, bool_from_env, int_from_env, load_env_file, sanitize_stem
+from telegram_bot.common import ROOT_DIR, bool_from_env, int_from_env, load_env_file, resolve_data_dir, sanitize_stem
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx"}
@@ -188,7 +188,7 @@ def process_input_file(
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         raise ProcessingError(f"Неподдерживаемый формат {suffix or '<без расширения>'}. Поддерживаются: {supported}")
 
-    root = Path(output_root or os.getenv("SNUG_BOT_DATA_DIR", ROOT_DIR / "telegram_bot_data")).expanduser()
+    root = Path(output_root).expanduser() if output_root else resolve_data_dir()
     jobs_root = root / "jobs"
     _notify(progress_callback, "job_prepare", "Создаю рабочую папку для обработки.")
     job_dir = _job_dir_for(source_path, jobs_root)
