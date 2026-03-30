@@ -438,6 +438,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
     }
 
     def worker() -> None:
+        job_recorded = False
         try:
             result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"], job_id)
             cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
@@ -451,6 +452,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "instance": INSTANCE_ID,
                 },
             )
+            job_recorded = True
         except ProcessingError as exc:
             _set_last_job(
                 chat_id,
@@ -462,6 +464,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "instance": INSTANCE_ID,
                 },
             )
+            job_recorded = True
             _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
         except Exception as exc:
             traceback.print_exc()
@@ -475,8 +478,34 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "instance": INSTANCE_ID,
                 },
             )
+            job_recorded = True
             _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
+        except BaseException as exc:
+            traceback.print_exc()
+            _set_last_job(
+                chat_id,
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "ended_at": time.time(),
+                    "instance": INSTANCE_ID,
+                },
+            )
+            job_recorded = True
+            _safe_notify(api, chat_id, f"Во время обработки произошла критическая ошибка: {exc}")
         finally:
+            if not job_recorded:
+                _set_last_job(
+                    chat_id,
+                    {
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": "worker exited without status",
+                        "ended_at": time.time(),
+                        "instance": INSTANCE_ID,
+                    },
+                )
             _clear_active_job(chat_id)
 
     thread = threading.Thread(target=worker, name=f"snug-bot-job-{chat_id}", daemon=True)
