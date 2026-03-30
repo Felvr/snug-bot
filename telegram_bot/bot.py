@@ -161,6 +161,10 @@ def _safe_send_document(api: TelegramBotAPI, chat_id: int, file_path: Path, capt
         traceback.print_exc()
 
 
+def _safe_notify_async(api: TelegramBotAPI, chat_id: int, text: str) -> None:
+    threading.Thread(target=_safe_notify, args=(api, chat_id, text), daemon=True).start()
+
+
 def _progress_message(stage: str, message: str) -> str:
     stage_titles = {
         "job_prepare": "Создаю задачу.",
@@ -346,7 +350,9 @@ def _process_document_job(
     def progress_callback(stage: str, message: str) -> None:
         formatted = _progress_message(stage, message)
         progress_state["last_stage_text"] = formatted.replace("\n", " ")
-        _safe_notify(api, chat_id, formatted)
+        # Keep callback non-blocking: network hiccups to Telegram should not pause parsing.
+        if stage in {"job_done", "pdf_vlm_done", "table_done"}:
+            _safe_notify_async(api, chat_id, formatted)
 
     stop_event, heartbeat_thread = _start_progress_heartbeat(
         api,
@@ -356,6 +362,7 @@ def _process_document_job(
     )
 
     try:
+        _safe_notify(api, chat_id, "Запускаю обработку в pipeline. Это может занять несколько минут.")
         result = process_input_file(
             local_input_path,
             output_root=base_dir,
