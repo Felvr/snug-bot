@@ -33,6 +33,9 @@ NETWORK_ERROR_TYPES = (
 
 ACTIVE_JOBS: dict[int, dict[str, Any]] = {}
 ACTIVE_JOBS_LOCK = threading.Lock()
+LAST_JOBS: dict[int, dict[str, Any]] = {}
+LAST_JOBS_LOCK = threading.Lock()
+INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
 class TelegramBotAPI:
@@ -239,6 +242,7 @@ def _status_message() -> str:
     with ACTIVE_JOBS_LOCK:
         active_job_count = sum(1 for state in ACTIVE_JOBS.values() if state.get("thread") and state["thread"].is_alive())
     return (
+        f"Instance: {INSTANCE_ID}\n"
         f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
         f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
         f"SNUG_BOT_DATA_DIR: {data_dir}\n"
@@ -247,6 +251,16 @@ def _status_message() -> str:
         f"SNUG_PIPELINE_ROUTING_STRATEGY: {os.getenv('SNUG_PIPELINE_ROUTING_STRATEGY', 'all')}\n"
         f"Active jobs: {active_job_count}"
     )
+
+
+def _set_last_job(chat_id: int, payload: dict[str, Any]) -> None:
+    with LAST_JOBS_LOCK:
+        LAST_JOBS[chat_id] = payload
+
+
+def _get_last_job(chat_id: int) -> dict[str, Any] | None:
+    with LAST_JOBS_LOCK:
+        return LAST_JOBS.get(chat_id)
 
 
 def _summary_caption(result: dict[str, Any]) -> str:
@@ -295,9 +309,24 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
         active = _get_active_job(chat_id)
         if active:
             stage = active.get("progress_state", {}).get("last_stage_text", "обработка")
-            api.send_message(chat_id, f"{_status_message()}\nТекущая задача: выполняется ({stage}).")
+            job_id = active.get("job_id", "-")
+            api.send_message(
+                chat_id,
+                f"{_status_message()}\nТекущая задача: выполняется (job={job_id}, stage={stage}).",
+            )
         else:
-            api.send_message(chat_id, _status_message())
+            last = _get_last_job(chat_id)
+            if not last:
+                api.send_message(chat_id, _status_message())
+            else:
+                ended = time.strftime("%H:%M:%S", time.localtime(last.get("ended_at", time.time())))
+                status = last.get("status", "unknown")
+                job_id = last.get("job_id", "-")
+                tail = f"Последняя задача: {status} (job={job_id}, ended={ended}, instance={last.get('instance', '-')})."
+                error = str(last.get("error", "")).strip()
+                if error:
+                    tail = f"{tail}\nПричина: {error}"
+                api.send_message(chat_id, f"{_status_message()}\n{tail}")
         return
     if command in {"/stop", "/cancel"}:
         active = _get_active_job(chat_id)
@@ -320,7 +349,7 @@ def _process_document_job(
     document: dict[str, Any],
     cancel_event: threading.Event,
     progress_state: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     file_name = document.get("file_name") or "upload.bin"
     suffix = Path(file_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
@@ -391,6 +420,8 @@ def _process_document_job(
         _safe_notify(api, chat_id, "Отправляю архив с промежуточными файлами и summary.")
         _safe_send_document(api, chat_id, archive_path, caption="Дополнительно отправляю архив со всеми артефактами обработки.")
 
+    return result
+
 
 def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]) -> None:
     if _get_active_job(chat_id):
@@ -398,18 +429,51 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
         return
 
     cancel_event = threading.Event()
+    job_id = uuid.uuid4().hex[:8]
     state: dict[str, Any] = {
+        "job_id": job_id,
         "cancel_event": cancel_event,
         "progress_state": {"last_stage_text": "ожидание запуска"},
     }
 
     def worker() -> None:
         try:
-            _process_document_job(api, chat_id, document, cancel_event, state["progress_state"])
+            result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"])
+            cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
+            _set_last_job(
+                chat_id,
+                {
+                    "job_id": job_id,
+                    "status": "cancelled" if cancelled else "done",
+                    "error": "",
+                    "ended_at": time.time(),
+                    "instance": INSTANCE_ID,
+                },
+            )
         except ProcessingError as exc:
+            _set_last_job(
+                chat_id,
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": f"ProcessingError: {exc}",
+                    "ended_at": time.time(),
+                    "instance": INSTANCE_ID,
+                },
+            )
             _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
         except Exception as exc:
             traceback.print_exc()
+            _set_last_job(
+                chat_id,
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "ended_at": time.time(),
+                    "instance": INSTANCE_ID,
+                },
+            )
             _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
         finally:
             _clear_active_job(chat_id)
