@@ -36,6 +36,38 @@ ACTIVE_JOBS_LOCK = threading.Lock()
 LAST_JOBS: dict[int, dict[str, Any]] = {}
 LAST_JOBS_LOCK = threading.Lock()
 INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
+RUN_ID = uuid.uuid4().hex[:8]
+PROCESS_STARTED_AT = time.time()
+
+
+def _last_job_state_dir() -> Path:
+    return resolve_data_dir() / "bot_state" / "last_jobs"
+
+
+def _last_job_state_path(chat_id: int) -> Path:
+    return _last_job_state_dir() / f"{chat_id}.json"
+
+
+def _save_last_job_to_disk(chat_id: int, payload: dict[str, Any]) -> None:
+    try:
+        state_dir = _last_job_state_dir()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        _last_job_state_path(chat_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        traceback.print_exc()
+
+
+def _load_last_job_from_disk(chat_id: int) -> dict[str, Any] | None:
+    path = _last_job_state_path(chat_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        traceback.print_exc()
+    return None
 
 
 class TelegramBotAPI:
@@ -241,8 +273,11 @@ def _status_message() -> str:
     data_dir = resolve_data_dir()
     with ACTIVE_JOBS_LOCK:
         active_job_count = sum(1 for state in ACTIVE_JOBS.values() if state.get("thread") and state["thread"].is_alive())
+    uptime_sec = int(max(0, time.time() - PROCESS_STARTED_AT))
     return (
         f"Instance: {INSTANCE_ID}\n"
+        f"Run: {RUN_ID}\n"
+        f"Uptime sec: {uptime_sec}\n"
         f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
         f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
         f"SNUG_BOT_DATA_DIR: {data_dir}\n"
@@ -256,11 +291,15 @@ def _status_message() -> str:
 def _set_last_job(chat_id: int, payload: dict[str, Any]) -> None:
     with LAST_JOBS_LOCK:
         LAST_JOBS[chat_id] = payload
+    _save_last_job_to_disk(chat_id, payload)
 
 
 def _get_last_job(chat_id: int) -> dict[str, Any] | None:
     with LAST_JOBS_LOCK:
-        return LAST_JOBS.get(chat_id)
+        in_memory = LAST_JOBS.get(chat_id)
+    if in_memory is not None:
+        return in_memory
+    return _load_last_job_from_disk(chat_id)
 
 
 def _summary_caption(result: dict[str, Any]) -> str:
@@ -322,7 +361,10 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
                 ended = time.strftime("%H:%M:%S", time.localtime(last.get("ended_at", time.time())))
                 status = last.get("status", "unknown")
                 job_id = last.get("job_id", "-")
-                tail = f"Последняя задача: {status} (job={job_id}, ended={ended}, instance={last.get('instance', '-')})."
+                tail = (
+                    f"Последняя задача: {status} "
+                    f"(job={job_id}, ended={ended}, instance={last.get('instance', '-')}, run={last.get('run', '-')})."
+                )
                 error = str(last.get("error", "")).strip()
                 if error:
                     tail = f"{tail}\nПричина: {error}"
@@ -364,7 +406,7 @@ def _process_document_job(
     incoming_dir = base_dir / "incoming"
     incoming_dir.mkdir(parents=True, exist_ok=True)
 
-    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку. job={job_id}, instance={INSTANCE_ID}")
+    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку. job={job_id}, instance={INSTANCE_ID}, run={RUN_ID}")
     _safe_notify(api, chat_id, "Скачиваю файл из Telegram в локальную рабочую папку.")
 
     telegram_file_path = api.get_file_path(document["file_id"])
@@ -392,7 +434,7 @@ def _process_document_job(
     )
 
     try:
-        _safe_notify(api, chat_id, f"Запускаю обработку в pipeline. Это может занять несколько минут. job={job_id}")
+        _safe_notify(api, chat_id, f"Запускаю обработку в pipeline. Это может занять несколько минут. job={job_id}, run={RUN_ID}")
         result = process_input_file(
             local_input_path,
             output_root=base_dir,
@@ -436,6 +478,17 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
         "cancel_event": cancel_event,
         "progress_state": {"last_stage_text": "ожидание запуска"},
     }
+    _set_last_job(
+        chat_id,
+        {
+            "job_id": job_id,
+            "status": "starting",
+            "error": "",
+            "ended_at": time.time(),
+            "instance": INSTANCE_ID,
+            "run": RUN_ID,
+        },
+    )
 
     def worker() -> None:
         job_recorded = False
@@ -450,6 +503,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "error": "",
                     "ended_at": time.time(),
                     "instance": INSTANCE_ID,
+                    "run": RUN_ID,
                 },
             )
             job_recorded = True
@@ -462,6 +516,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "error": f"ProcessingError: {exc}",
                     "ended_at": time.time(),
                     "instance": INSTANCE_ID,
+                    "run": RUN_ID,
                 },
             )
             job_recorded = True
@@ -476,6 +531,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "error": f"{exc.__class__.__name__}: {exc}",
                     "ended_at": time.time(),
                     "instance": INSTANCE_ID,
+                    "run": RUN_ID,
                 },
             )
             job_recorded = True
@@ -490,6 +546,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                     "error": f"{exc.__class__.__name__}: {exc}",
                     "ended_at": time.time(),
                     "instance": INSTANCE_ID,
+                    "run": RUN_ID,
                 },
             )
             job_recorded = True
@@ -504,6 +561,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                         "error": "worker exited without status",
                         "ended_at": time.time(),
                         "instance": INSTANCE_ID,
+                        "run": RUN_ID,
                     },
                 )
             _clear_active_job(chat_id)
