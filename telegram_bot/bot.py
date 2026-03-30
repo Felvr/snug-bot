@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import mimetypes
 import os
@@ -41,6 +42,13 @@ RUN_ID = uuid.uuid4().hex[:8]
 PROCESS_STARTED_AT = time.time()
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger("snug-bot")
+
+
 def _last_job_state_dir() -> Path:
     return resolve_data_dir() / "bot_state" / "last_jobs"
 
@@ -55,7 +63,7 @@ def _save_last_job_to_disk(chat_id: int, payload: dict[str, Any]) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         _last_job_state_path(chat_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        traceback.print_exc()
+        LOGGER.exception("Failed to persist last job for chat_id=%s", chat_id)
 
 
 def _load_last_job_from_disk(chat_id: int) -> dict[str, Any] | None:
@@ -67,7 +75,7 @@ def _load_last_job_from_disk(chat_id: int) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             return payload
     except Exception:
-        traceback.print_exc()
+        LOGGER.exception("Failed to load last job for chat_id=%s", chat_id)
     return None
 
 
@@ -200,18 +208,18 @@ def _safe_notify(api: TelegramBotAPI, chat_id: int, text: str) -> None:
     try:
         api.send_message(chat_id, text)
     except NETWORK_ERROR_TYPES as exc:
-        print(_format_network_error(exc))
+        LOGGER.warning("Notify failed chat_id=%s: %s", chat_id, _format_network_error(exc))
     except Exception:
-        traceback.print_exc()
+        LOGGER.exception("Unexpected notify error for chat_id=%s", chat_id)
 
 
 def _safe_send_document(api: TelegramBotAPI, chat_id: int, file_path: Path, caption: str = "") -> None:
     try:
         api.send_document(chat_id, file_path, caption=caption)
     except NETWORK_ERROR_TYPES as exc:
-        print(_format_network_error(exc))
+        LOGGER.warning("Send document failed chat_id=%s path=%s: %s", chat_id, file_path, _format_network_error(exc))
     except Exception:
-        traceback.print_exc()
+        LOGGER.exception("Unexpected send_document error for chat_id=%s path=%s", chat_id, file_path)
 
 
 def _safe_notify_async(api: TelegramBotAPI, chat_id: int, text: str) -> None:
@@ -283,27 +291,11 @@ def _support_message() -> str:
 
 
 def _status_message() -> str:
-    api_key_present = bool(
-        os.getenv("VLM_API_KEY", "").strip()
-        or os.getenv("OPENROUTER_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-    )
-    data_dir = resolve_data_dir()
     with ACTIVE_JOBS_LOCK:
         active_job_count = sum(1 for state in ACTIVE_JOBS.values() if state.get("thread") and state["thread"].is_alive())
-    uptime_sec = int(max(0, time.time() - PROCESS_STARTED_AT))
-    return (
-        f"Instance: {INSTANCE_ID}\n"
-        f"Run: {RUN_ID}\n"
-        f"Uptime sec: {uptime_sec}\n"
-        f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
-        f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
-        f"SNUG_BOT_DATA_DIR: {data_dir}\n"
-        f"SNUG_PIPELINE_TWO_PHASE: {os.getenv('SNUG_PIPELINE_TWO_PHASE', '1')}\n"
-        f"SNUG_PIPELINE_PAGE_STRATEGY: {os.getenv('SNUG_PIPELINE_PAGE_STRATEGY', 'all')}\n"
-        f"SNUG_PIPELINE_ROUTING_STRATEGY: {os.getenv('SNUG_PIPELINE_ROUTING_STRATEGY', 'all')}\n"
-        f"Active jobs: {active_job_count}"
-    )
+    if active_job_count > 0:
+        return "Статус: выполняется обработка файла."
+    return "Статус: сейчас нет активной обработки."
 
 
 def _set_last_job(chat_id: int, payload: dict[str, Any]) -> None:
@@ -321,18 +313,12 @@ def _get_last_job(chat_id: int) -> dict[str, Any] | None:
 
 
 def _summary_caption(result: dict[str, Any]) -> str:
-    summary = result["summary"]
     catalog_csv = str(result.get("catalog_product_csv", "") or "").strip()
     catalog_name = Path(catalog_csv).name if catalog_csv else "catalog_product.csv"
-    clean_rows = summary.get("clean_rows", "")
-    price_nonzero = summary.get("price_nonzero", "")
-    mode = summary.get("mode", "")
+    summary = result.get("summary", {})
     cancelled = int(summary.get("cancelled", result.get("cancelled", 0)))
     status = "Остановлено" if cancelled else "Готово"
-    return (
-        f"{status}: {catalog_name}\n"
-        f"mode={mode}, rows={clean_rows}, price_nonzero={price_nonzero}"
-    )
+    return f"{status}: {catalog_name}"
 
 
 def _get_active_job(chat_id: int) -> dict[str, Any] | None:
@@ -366,10 +352,9 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
         active = _get_active_job(chat_id)
         if active:
             stage = active.get("progress_state", {}).get("last_stage_text", "обработка")
-            job_id = active.get("job_id", "-")
             api.send_message(
                 chat_id,
-                f"{_status_message()}\nТекущая задача: выполняется (job={job_id}, stage={stage}).",
+                f"{_status_message()}\nТекущий этап: {stage}.",
             )
         else:
             last = _get_last_job(chat_id)
@@ -378,14 +363,14 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
             else:
                 ended = time.strftime("%H:%M:%S", time.localtime(last.get("ended_at", time.time())))
                 status = last.get("status", "unknown")
-                job_id = last.get("job_id", "-")
-                tail = (
-                    f"Последняя задача: {status} "
-                    f"(job={job_id}, ended={ended}, instance={last.get('instance', '-')}, run={last.get('run', '-')})."
-                )
-                error = str(last.get("error", "")).strip()
-                if error:
-                    tail = f"{tail}\nПричина: {error}"
+                status_map = {
+                    "starting": "запускается",
+                    "done": "завершена",
+                    "cancelled": "остановлена",
+                    "failed": "завершилась с ошибкой",
+                }
+                human_status = status_map.get(status, "неизвестно")
+                tail = f"Последняя задача: {human_status} (в {ended})."
                 api.send_message(chat_id, f"{_status_message()}\n{tail}")
         return
     if command in {"/stop", "/cancel"}:
@@ -403,7 +388,7 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
             try:
                 worker_process.terminate()
             except Exception:
-                traceback.print_exc()
+                LOGGER.exception("Failed terminating worker_process on /stop for chat_id=%s", chat_id)
         api.send_message(chat_id, "Принял /stop. Останавливаю обработку и подготовлю доступные результаты.")
         return
     api.send_message(chat_id, _support_message())
@@ -431,7 +416,8 @@ def _process_document_job(
     incoming_dir = base_dir / "incoming"
     incoming_dir.mkdir(parents=True, exist_ok=True)
 
-    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку. job={job_id}, instance={INSTANCE_ID}, run={RUN_ID}")
+    LOGGER.info("Job started chat_id=%s job_id=%s instance=%s run=%s file=%s", chat_id, job_id, INSTANCE_ID, RUN_ID, file_name)
+    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку.")
     _safe_notify(api, chat_id, "Скачиваю файл из Telegram в локальную рабочую папку.")
 
     telegram_file_path = api.get_file_path(document["file_id"])
@@ -459,7 +445,7 @@ def _process_document_job(
     )
 
     try:
-        _safe_notify(api, chat_id, f"Запускаю обработку в pipeline. Это может занять несколько минут. job={job_id}, run={RUN_ID}")
+        _safe_notify(api, chat_id, "Запускаю обработку в pipeline. Это может занять несколько минут.")
         result_path = base_dir / "bot_state" / "ipc" / f"{chat_id}_{job_id}.json"
         mp_ctx = multiprocessing.get_context("spawn")
         worker_proc = mp_ctx.Process(
@@ -469,7 +455,8 @@ def _process_document_job(
         )
         job_state["worker_process"] = worker_proc
         worker_proc.start()
-        progress_state["last_stage_text"] = f"pipeline subprocess pid={worker_proc.pid}"
+        progress_state["last_stage_text"] = "обработка данных"
+        LOGGER.info("Subprocess started chat_id=%s job_id=%s pid=%s", chat_id, job_id, worker_proc.pid)
 
         was_cancelled = False
         while worker_proc.is_alive():
@@ -482,7 +469,12 @@ def _process_document_job(
         if not was_cancelled:
             worker_proc.join(timeout=1)
 
-        if was_cancelled:
+        # /stop can terminate subprocess before it writes result JSON.
+        # In that case, treat termination as a normal cancellation path.
+        terminated_by_stop = bool(cancel_event.is_set() and worker_proc.exitcode in {-15, 143})
+
+        if was_cancelled or terminated_by_stop:
+            LOGGER.info("Job cancelled chat_id=%s job_id=%s exit_code=%s", chat_id, job_id, worker_proc.exitcode)
             result = {
                 "catalog_product_csv": "",
                 "clean_csv": "",
@@ -495,8 +487,10 @@ def _process_document_job(
             if payload.get("ok"):
                 result = payload.get("result", {})
             else:
+                LOGGER.error("Subprocess returned error chat_id=%s job_id=%s payload=%s", chat_id, job_id, payload)
                 raise ProcessingError(str(payload.get("error", "subprocess failed")))
         else:
+            LOGGER.error("Subprocess exited without result chat_id=%s job_id=%s exit_code=%s", chat_id, job_id, worker_proc.exitcode)
             raise ProcessingError(
                 f"Pipeline subprocess exited with code {worker_proc.exitcode} and produced no result file"
             )
@@ -509,8 +503,10 @@ def _process_document_job(
     cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
     if cancelled:
         _safe_notify(api, chat_id, "Обработка остановлена по запросу. Отправляю всё, что успело сохраниться.")
+        LOGGER.info("Job finished as cancelled chat_id=%s job_id=%s", chat_id, job_id)
     else:
         _safe_notify(api, chat_id, "Отправляю готовый catalog_product.csv.")
+        LOGGER.info("Job finished successfully chat_id=%s job_id=%s", chat_id, job_id)
 
     catalog_csv = str(result.get("catalog_product_csv", "") or "").strip()
     if catalog_csv and Path(catalog_csv).exists():
@@ -569,6 +565,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
             )
             job_recorded = True
         except ProcessingError as exc:
+            LOGGER.exception("ProcessingError in worker chat_id=%s job_id=%s", chat_id, job_id)
             _set_last_job(
                 chat_id,
                 {
@@ -581,9 +578,9 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                 },
             )
             job_recorded = True
-            _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
+            _safe_notify(api, chat_id, "Не удалось обработать файл. Подробности записаны в логах сервера.")
         except Exception as exc:
-            traceback.print_exc()
+            LOGGER.exception("Unhandled exception in worker chat_id=%s job_id=%s", chat_id, job_id)
             _set_last_job(
                 chat_id,
                 {
@@ -596,9 +593,9 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                 },
             )
             job_recorded = True
-            _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
+            _safe_notify(api, chat_id, "Во время обработки произошла ошибка. Подробности записаны в логах сервера.")
         except BaseException as exc:
-            traceback.print_exc()
+            LOGGER.exception("BaseException in worker chat_id=%s job_id=%s", chat_id, job_id)
             _set_last_job(
                 chat_id,
                 {
@@ -611,7 +608,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
                 },
             )
             job_recorded = True
-            _safe_notify(api, chat_id, f"Во время обработки произошла критическая ошибка: {exc}")
+            _safe_notify(api, chat_id, "Во время обработки произошла критическая ошибка. Подробности записаны в логах сервера.")
         finally:
             if not job_recorded:
                 _set_last_job(
@@ -672,13 +669,13 @@ def main() -> None:
                 offset = int(update["update_id"]) + 1
                 handle_update(api, update)
         except NETWORK_ERROR_TYPES as exc:
-            print(_format_network_error(exc))
+            LOGGER.warning(_format_network_error(exc))
             time.sleep(retry_delay_sec)
         except KeyboardInterrupt:
-            print("Bot stopped.")
+            LOGGER.info("Bot stopped.")
             return
         except Exception:
-            traceback.print_exc()
+            LOGGER.exception("Unhandled error in poll loop")
             time.sleep(retry_delay_sec)
 
 
