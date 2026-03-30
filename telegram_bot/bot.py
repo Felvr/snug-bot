@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import mimetypes
 import os
 import socket
@@ -68,6 +69,23 @@ def _load_last_job_from_disk(chat_id: int) -> dict[str, Any] | None:
     except Exception:
         traceback.print_exc()
     return None
+
+
+def _process_file_subprocess_entry(input_path: str, output_root: str, result_json_path: str) -> None:
+    payload: dict[str, Any]
+    try:
+        result = process_input_file(
+            input_path,
+            output_root=output_root,
+            progress_callback=None,
+            stop_requested=None,
+        )
+        payload = {"ok": True, "result": result}
+    except BaseException as exc:
+        payload = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    result_path = Path(result_json_path)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 class TelegramBotAPI:
@@ -380,6 +398,12 @@ def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
             api.send_message(chat_id, "Не удалось остановить задачу: внутреннее состояние недоступно.")
             return
         cancel_event.set()
+        worker_process = active.get("worker_process")
+        if worker_process is not None and getattr(worker_process, "is_alive", None) and worker_process.is_alive():
+            try:
+                worker_process.terminate()
+            except Exception:
+                traceback.print_exc()
         api.send_message(chat_id, "Принял /stop. Останавливаю обработку и подготовлю доступные результаты.")
         return
     api.send_message(chat_id, _support_message())
@@ -392,6 +416,7 @@ def _process_document_job(
     cancel_event: threading.Event,
     progress_state: dict[str, Any],
     job_id: str,
+    job_state: dict[str, Any],
 ) -> dict[str, Any]:
     file_name = document.get("file_name") or "upload.bin"
     suffix = Path(file_name).suffix.lower()
@@ -435,16 +460,51 @@ def _process_document_job(
 
     try:
         _safe_notify(api, chat_id, f"Запускаю обработку в pipeline. Это может занять несколько минут. job={job_id}, run={RUN_ID}")
-        result = process_input_file(
-            local_input_path,
-            output_root=base_dir,
-            progress_callback=progress_callback,
-            stop_requested=cancel_event.is_set,
+        result_path = base_dir / "bot_state" / "ipc" / f"{chat_id}_{job_id}.json"
+        mp_ctx = multiprocessing.get_context("spawn")
+        worker_proc = mp_ctx.Process(
+            target=_process_file_subprocess_entry,
+            args=(str(local_input_path), str(base_dir), str(result_path)),
+            daemon=True,
         )
+        job_state["worker_process"] = worker_proc
+        worker_proc.start()
+        progress_state["last_stage_text"] = f"pipeline subprocess pid={worker_proc.pid}"
+
+        was_cancelled = False
+        while worker_proc.is_alive():
+            if cancel_event.is_set():
+                was_cancelled = True
+                worker_proc.terminate()
+                worker_proc.join(timeout=10)
+                break
+            time.sleep(0.2)
+        if not was_cancelled:
+            worker_proc.join(timeout=1)
+
+        if was_cancelled:
+            result = {
+                "catalog_product_csv": "",
+                "clean_csv": "",
+                "artifacts_zip": "",
+                "cancelled": 1,
+                "summary": {"mode": "", "clean_rows": 0, "price_nonzero": 0, "cancelled": 1},
+            }
+        elif result_path.exists():
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            if payload.get("ok"):
+                result = payload.get("result", {})
+            else:
+                raise ProcessingError(str(payload.get("error", "subprocess failed")))
+        else:
+            raise ProcessingError(
+                f"Pipeline subprocess exited with code {worker_proc.exitcode} and produced no result file"
+            )
     finally:
         stop_event.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1)
+        job_state.pop("worker_process", None)
 
     cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
     if cancelled:
@@ -458,8 +518,9 @@ def _process_document_job(
     else:
         _safe_notify(api, chat_id, "Итоговый catalog_product.csv на текущем этапе отсутствует.")
 
-    archive_path = Path(result["artifacts_zip"])
-    if archive_path.exists():
+    archive_zip = str(result.get("artifacts_zip", "") or "").strip()
+    archive_path = Path(archive_zip) if archive_zip else None
+    if archive_path is not None and archive_path.is_file():
         _safe_notify(api, chat_id, "Отправляю архив с промежуточными файлами и summary.")
         _safe_send_document(api, chat_id, archive_path, caption="Дополнительно отправляю архив со всеми артефактами обработки.")
 
@@ -493,7 +554,7 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
     def worker() -> None:
         job_recorded = False
         try:
-            result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"], job_id)
+            result = _process_document_job(api, chat_id, document, cancel_event, state["progress_state"], job_id, state)
             cancelled = int(result.get("cancelled", result.get("summary", {}).get("cancelled", 0)))
             _set_last_job(
                 chat_id,
