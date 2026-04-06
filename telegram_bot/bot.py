@@ -190,25 +190,13 @@ def _support_message() -> str:
     return (
         "Пришлите PDF, CSV или XLSX с прайсом.\n"
         "Бот запустит текущий SNUG pipeline и вернёт готовый catalog_product.csv для выгрузки на сайт."
-        f"\nПоддерживаемые форматы: {formats}"
+        f"\nПоддерживаемые форматы: {formats}\n"
+        "Команды: /status, /stop"
     )
 
 
-def _status_env_message() -> str:
-    api_key_present = bool(
-        os.getenv("VLM_API_KEY", "").strip()
-        or os.getenv("OPENROUTER_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-    )
-    data_dir = resolve_data_dir()
-    return (
-        f"TELEGRAM_BOT_TOKEN: {'ok' if bool(os.getenv('TELEGRAM_BOT_TOKEN', '').strip()) else 'missing'}\n"
-        f"VLM API key: {'ok' if api_key_present else 'missing'}\n"
-        f"SNUG_BOT_DATA_DIR: {data_dir}\n"
-        f"SNUG_PIPELINE_TWO_PHASE: {os.getenv('SNUG_PIPELINE_TWO_PHASE', '1')}\n"
-        f"SNUG_PIPELINE_PAGE_STRATEGY: {os.getenv('SNUG_PIPELINE_PAGE_STRATEGY', 'all')}\n"
-        f"SNUG_PIPELINE_ROUTING_STRATEGY: {os.getenv('SNUG_PIPELINE_ROUTING_STRATEGY', 'all')}"
-    )
+class JobCancelledError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -226,6 +214,7 @@ class JobState:
     finished_at: float | None = None
     result: dict[str, Any] | None = None
     error: str = ""
+    cancel_requested: bool = False
 
 
 class JobManager:
@@ -297,9 +286,20 @@ class JobManager:
                     f"price_nonzero={summary.get('price_nonzero', '?')}"
                 )
             else:
-                lines.append(f"Последняя ошибка: #{last.id} {last.file_name} | {last.error or 'unknown error'}")
+                lines.append(f"Последняя задача завершилась с ошибкой: #{last.id} {last.file_name}")
 
         return "\n".join(lines)
+
+    def request_stop(self, chat_id: int) -> str:
+        with self._lock:
+            running_for_chat = [j for j in self._jobs.values() if j.chat_id == chat_id and j.status == "running"]
+
+            for job in running_for_chat:
+                job.cancel_requested = True
+
+        if running_for_chat:
+            return "Останавливаю текущую задачу. Следующая задача начнется автоматически."
+        return "Сейчас нет активных задач для остановки."
 
     def _worker(self) -> None:
         while True:
@@ -337,6 +337,12 @@ class JobManager:
             job.error = error
             job.finished_at = time.monotonic()
 
+    def _cancel_if_requested(self, job: JobState) -> None:
+        with self._lock:
+            should_cancel = bool(job.cancel_requested)
+        if should_cancel:
+            raise JobCancelledError("cancelled")
+
     def _run_job(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -362,14 +368,22 @@ class JobManager:
         local_input_path = incoming_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}{job.suffix}"
 
         try:
+            self._cancel_if_requested(job)
             telegram_file_path = self.api.get_file_path(job.file_id)
             self.api.download_file(telegram_file_path, local_input_path)
+            self._cancel_if_requested(job)
+
+            def progress_callback(stage: str, message: str) -> None:
+                self._cancel_if_requested(job)
+                self._set_progress(job, stage, message)
 
             result = process_input_file(
                 local_input_path,
                 output_root=self.base_dir,
-                progress_callback=lambda stage, message: self._set_progress(job, stage, message),
+                progress_callback=progress_callback,
+                cancel_callback=lambda: self._cancel_if_requested(job),
             )
+            self._cancel_if_requested(job)
             self._set_done(job, result)
 
             _safe_send_document(
@@ -387,13 +401,16 @@ class JobManager:
                     archive_path,
                     caption="Архив с промежуточными файлами и summary.",
                 )
+        except JobCancelledError:
+            self._set_failed(job, "cancelled")
+            _safe_notify(self.api, job.chat_id, f"Задача #{job.id} остановлена. Можно отправлять следующий файл.")
         except ProcessingError as exc:
             self._set_failed(job, str(exc))
-            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: не удалось обработать файл: {exc}")
+            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: не удалось обработать файл.")
         except Exception as exc:
             traceback.print_exc()
             self._set_failed(job, str(exc))
-            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: во время обработки произошла ошибка: {exc}")
+            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: во время обработки произошла ошибка.")
         finally:
             try:
                 local_input_path.unlink(missing_ok=True)
@@ -406,10 +423,10 @@ def _summary_caption(result: dict[str, Any]) -> str:
     catalog_path = Path(result["catalog_product_csv"])
     clean_rows = summary.get("clean_rows", "")
     price_nonzero = summary.get("price_nonzero", "")
-    mode = summary.get("mode", "")
     return (
         f"Готово: {catalog_path.name}\n"
-        f"mode={mode}, rows={clean_rows}, price_nonzero={price_nonzero}"
+        f"Строк после очистки: {clean_rows}\n"
+        f"С ценой: {price_nonzero}"
     )
 
 
@@ -419,7 +436,10 @@ def _handle_command(api: TelegramBotAPI, jobs: JobManager, chat_id: int, text: s
         api.send_message(chat_id, _support_message())
         return
     if command == "/status":
-        api.send_message(chat_id, f"{jobs.get_status_text(chat_id)}\n\n{_status_env_message()}")
+        api.send_message(chat_id, jobs.get_status_text(chat_id))
+        return
+    if command == "/stop":
+        api.send_message(chat_id, jobs.request_stop(chat_id))
         return
     api.send_message(chat_id, _support_message())
 
@@ -459,10 +479,10 @@ def handle_update(api: TelegramBotAPI, jobs: JobManager, update: dict[str, Any])
         try:
             _handle_document(api, jobs, chat_id, document)
         except ProcessingError as exc:
-            _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
+            _safe_notify(api, chat_id, "Не удалось обработать файл.")
         except Exception as exc:
             traceback.print_exc()
-            _safe_notify(api, chat_id, f"Во время обработки произошла ошибка: {exc}")
+            _safe_notify(api, chat_id, "Во время обработки произошла ошибка.")
         return
 
     api.send_message(chat_id, _support_message())

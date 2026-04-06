@@ -320,6 +320,11 @@ class RoutedPage:
     category: str
 
 
+def _check_cancel(cancel_check: Any | None) -> None:
+    if cancel_check is not None:
+        cancel_check()
+
+
 def env_first(keys: Iterable[str]) -> str:
     for key in keys:
         value = os.environ.get(key, "").strip()
@@ -863,7 +868,9 @@ def route_pdf_pages(
     start_page: int = 10,
     explicit_pages: list[int] | None = None,
     dpi: int = 120,
+    cancel_check: Any | None = None,
 ) -> list[RoutedPage]:
+    _check_cancel(cancel_check)
     pdf_path = Path(pdf_path)
     try:
         import pdfplumber
@@ -882,8 +889,10 @@ def route_pdf_pages(
     routed: list[RoutedPage] = []
     delay_sec = router_request_delay_sec(client)
     for index, (page_num, image) in enumerate(render_pages(pdf_path, selected_pages, dpi=dpi)):
+        _check_cancel(cancel_check)
         if index > 0 and delay_sec > 0:
             time.sleep(delay_sec)
+        _check_cancel(cancel_check)
         category = client.classify_page(image, page_num)
         routed.append(RoutedPage(page_num=page_num, category=category))
     return routed
@@ -898,7 +907,9 @@ def extract_pdf_records(
     start_page: int = 1,
     explicit_pages: list[int] | None = None,
     dpi: int = DEFAULT_DPI,
+    cancel_check: Any | None = None,
 ) -> pd.DataFrame:
+    _check_cancel(cancel_check)
     pdf_path = Path(pdf_path)
     try:
         import pdfplumber
@@ -918,13 +929,16 @@ def extract_pdf_records(
     delay_sec = router_request_delay_sec(client)
     extraction_delay_sec = extraction_request_delay_sec(client)
     for index, (page_num, image) in enumerate(render_pages(pdf_path, selected_pages, dpi=dpi)):
+        _check_cancel(cancel_check)
         if index > 0 and delay_sec > 0:
             time.sleep(delay_sec)
+        _check_cancel(cancel_check)
         category = client.classify_page(image, page_num)
         if category == "Skip":
             continue
         if extraction_delay_sec > 0:
             time.sleep(extraction_delay_sec)
+        _check_cancel(cancel_check)
         items = client.extract_page_items(image, category)
         for item in items:
             normalized = normalize_vlm_item(
@@ -949,7 +963,9 @@ def extract_pdf_records_two_phase(
     routing_explicit_pages: list[int] | None = None,
     routing_dpi: int = 120,
     extraction_dpi: int = DEFAULT_DPI,
+    cancel_check: Any | None = None,
 ) -> tuple[pd.DataFrame, list[RoutedPage]]:
+    _check_cancel(cancel_check)
     pdf_path = Path(pdf_path)
     routed_pages = route_pdf_pages(
         pdf_path,
@@ -959,15 +975,18 @@ def extract_pdf_records_two_phase(
         start_page=routing_start_page,
         explicit_pages=routing_explicit_pages,
         dpi=routing_dpi,
+        cancel_check=cancel_check,
     )
     extraction_targets = [page.page_num for page in routed_pages if page.category != "Skip"]
     category_by_page = {page.page_num: ("Generic" if page.category == "Other" else page.category) for page in routed_pages}
     rows: list[dict[str, Any]] = []
     delay_sec = extraction_request_delay_sec(client)
     for index, (page_num, image) in enumerate(render_pages(pdf_path, extraction_targets, dpi=extraction_dpi)):
+        _check_cancel(cancel_check)
         category = category_by_page.get(page_num, "Generic")
         if index > 0 and delay_sec > 0:
             time.sleep(delay_sec)
+        _check_cancel(cancel_check)
         items = client.extract_page_items(image, category)
         for item in items:
             normalized = normalize_vlm_item(
@@ -1009,7 +1028,9 @@ def process_single_pdf(
     routing_start_page: int = 1,
     routing_explicit_pages: list[int] | None = None,
     routing_dpi: int = 120,
+    cancel_check: Any | None = None,
 ) -> dict[str, Any]:
+    _check_cancel(cancel_check)
     pdf_path = Path(pdf_path)
     started = time.time()
     routed_pages: list[RoutedPage] = []
@@ -1023,6 +1044,7 @@ def process_single_pdf(
             routing_explicit_pages=routing_explicit_pages or explicit_pages,
             routing_dpi=routing_dpi,
             extraction_dpi=dpi,
+            cancel_check=cancel_check,
         )
     else:
         raw_df = extract_pdf_records(
@@ -1033,7 +1055,9 @@ def process_single_pdf(
             start_page=start_page,
             explicit_pages=explicit_pages,
             dpi=dpi,
+            cancel_check=cancel_check,
         )
+    _check_cancel(cancel_check)
     raw_df = unify_brand_per_pdf(raw_df) if not raw_df.empty else raw_df.copy()
     clean_df = clean_furniture_catalog(raw_df) if not raw_df.empty else raw_df.copy()
     export_df = export_catalog_product(clean_df) if not clean_df.empty else pd.DataFrame(columns=TARGET_EXPORT_COLUMNS)

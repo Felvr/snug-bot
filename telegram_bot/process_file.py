@@ -26,11 +26,17 @@ class ProcessingError(RuntimeError):
 
 
 ProgressCallback = Callable[[str, str], None]
+CancelCallback = Callable[[], None]
 
 
 def _notify(progress_callback: ProgressCallback | None, stage: str, message: str) -> None:
     if progress_callback is not None:
         progress_callback(stage, message)
+
+
+def _check_cancel(cancel_callback: CancelCallback | None) -> None:
+    if cancel_callback is not None:
+        cancel_callback()
 
 
 def _load_pipeline_module():
@@ -85,7 +91,9 @@ def _process_pdf(
     input_path: Path,
     output_dir: Path,
     progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _check_cancel(cancel_callback)
     _notify(progress_callback, "pdf_prepare", "Готовлю PDF-пайплайн и проверяю зависимости.")
     pipeline = _load_pipeline_module()
     cfg = pipeline.config_from_env()
@@ -98,13 +106,16 @@ def _process_pdf(
         "pdf_vlm_start",
         "Запускаю VLM-разбор PDF. Это самый долгий этап, особенно на больших прайсах.",
     )
+    _check_cancel(cancel_callback)
     client = pipeline.OpenAICompatVLMClient(cfg)
     result = pipeline.process_single_pdf(
         input_path,
         client=client,
         output_dir=output_dir,
+        cancel_check=cancel_callback,
         **_pipeline_kwargs(pipeline),
     )
+    _check_cancel(cancel_callback)
     pd.DataFrame([result]).to_csv(output_dir / "batch_summary.csv", index=False)
     _notify(
         progress_callback,
@@ -125,16 +136,21 @@ def _process_table(
     input_path: Path,
     output_dir: Path,
     progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _check_cancel(cancel_callback)
     _notify(progress_callback, "table_prepare", "Открываю таблицу и готовлю постобработку.")
     pipeline = _load_pipeline_module()
     from arxiv.furniture_postprocess import clean_furniture_catalog
 
     _notify(progress_callback, "table_read", "Читаю входную таблицу.")
+    _check_cancel(cancel_callback)
     raw_df = _load_tabular_file(input_path)
     _notify(progress_callback, "table_clean", "Очищаю и нормализую данные.")
+    _check_cancel(cancel_callback)
     clean_df = clean_furniture_catalog(raw_df)
     _notify(progress_callback, "table_export", "Собираю итоговый catalog_product.csv.")
+    _check_cancel(cancel_callback)
     export_df = pipeline.export_catalog_product(clean_df)
 
     raw_path = output_dir / f"{input_path.stem}__raw.csv"
@@ -142,7 +158,9 @@ def _process_table(
     export_path = output_dir / f"{input_path.stem}__catalog_product.csv"
 
     raw_df.to_csv(raw_path, index=False)
+    _check_cancel(cancel_callback)
     clean_df.to_csv(clean_path, index=False)
+    _check_cancel(cancel_callback)
     export_df.to_csv(export_path, index=False)
 
     result = {
@@ -179,8 +197,10 @@ def process_input_file(
     input_path: str | Path,
     output_root: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
 ) -> dict[str, Any]:
     load_env_file()
+    _check_cancel(cancel_callback)
     source_path = Path(input_path).expanduser().resolve()
     if not source_path.exists():
         raise ProcessingError(f"Файл не найден: {source_path}")
@@ -193,6 +213,7 @@ def process_input_file(
     root = Path(output_root).expanduser() if output_root else resolve_data_dir()
     jobs_root = root / "jobs"
     _notify(progress_callback, "job_prepare", "Создаю рабочую папку для обработки.")
+    _check_cancel(cancel_callback)
     job_dir = _job_dir_for(source_path, jobs_root)
     input_dir = job_dir / "input"
     output_dir = job_dir / "output"
@@ -200,13 +221,25 @@ def process_input_file(
 
     _notify(progress_callback, "job_copy_input", "Сохраняю входной файл в рабочую папку.")
     job_input_path = _copy_to_job_input(source_path, input_dir)
+    _check_cancel(cancel_callback)
     _notify(progress_callback, "job_detect_type", f"Определил формат файла: {suffix}.")
     if suffix == ".pdf":
-        result = _process_pdf(job_input_path, output_dir, progress_callback=progress_callback)
+        result = _process_pdf(
+            job_input_path,
+            output_dir,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        )
     else:
-        result = _process_table(job_input_path, output_dir, progress_callback=progress_callback)
+        result = _process_table(
+            job_input_path,
+            output_dir,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        )
 
     _notify(progress_callback, "job_archive", "Упаковываю вспомогательные файлы в архив.")
+    _check_cancel(cancel_callback)
     archive_path = _zip_output_dir(output_dir, job_dir / "artifacts.zip")
     catalog_path = Path(result["catalog_product_csv"]).resolve()
     clean_path = Path(result["clean_csv"]).resolve()
