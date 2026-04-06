@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -306,6 +307,11 @@ class VLMConfig:
     router_model: str = DEFAULT_ROUTER_MODEL
     timeout_sec: int = 180
     temperature: float = 0.0
+    router_request_delay_sec: float = 0.0
+    extraction_request_delay_sec: float = 0.0
+    request_retries: int = 2
+    retry_backoff_sec: float = 1.5
+    retry_backoff_max_sec: float = 12.0
 
 
 @dataclass
@@ -322,6 +328,26 @@ def env_first(keys: Iterable[str]) -> str:
     return ""
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def config_from_env() -> VLMConfig | None:
     api_key = env_first(["VLM_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"])
     if not api_key:
@@ -334,6 +360,11 @@ def config_from_env() -> VLMConfig | None:
         base_url=base_url,
         extraction_model=extraction_model,
         router_model=router_model,
+        router_request_delay_sec=env_float("VLM_ROUTER_REQUEST_DELAY_SEC", 0.0),
+        extraction_request_delay_sec=env_float("VLM_EXTRACTION_REQUEST_DELAY_SEC", 0.0),
+        request_retries=max(0, env_int("VLM_REQUEST_RETRIES", 2)),
+        retry_backoff_sec=max(0.0, env_float("VLM_RETRY_BACKOFF_SEC", 1.5)),
+        retry_backoff_max_sec=max(0.0, env_float("VLM_RETRY_BACKOFF_MAX_SEC", 12.0)),
     )
 
 
@@ -443,6 +474,19 @@ class OpenAICompatVLMClient:
     def __init__(self, config: VLMConfig):
         self.config = config
 
+    @staticmethod
+    def _is_retryable_http_status(code: int) -> bool:
+        return code in {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}
+
+    def _retry_delay(self, retry_index: int) -> float:
+        if self.config.retry_backoff_sec <= 0:
+            return 0.0
+        delay = self.config.retry_backoff_sec * (2 ** max(0, retry_index - 1))
+        max_delay = self.config.retry_backoff_max_sec
+        if max_delay > 0:
+            delay = min(delay, max_delay)
+        return max(0.0, delay)
+
     def _post_chat_completions(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0.0) -> str:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = {
@@ -460,14 +504,31 @@ class OpenAICompatVLMClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_sec) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"VLM HTTP {exc.code}: {body[:800]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"VLM network error: {exc}") from exc
+        total_attempts = max(1, int(self.config.request_retries) + 1)
+        last_error: BaseException | None = None
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.config.timeout_sec) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")
+                last_error = RuntimeError(f"VLM HTTP {exc.code}: {body[:800]}")
+                if not self._is_retryable_http_status(exc.code) or attempt >= total_attempts:
+                    raise last_error from exc
+                delay = self._retry_delay(attempt)
+                if delay > 0:
+                    time.sleep(delay)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.RemoteDisconnected) as exc:
+                last_error = RuntimeError(f"VLM network error: {exc}")
+                if attempt >= total_attempts:
+                    raise last_error from exc
+                delay = self._retry_delay(attempt)
+                if delay > 0:
+                    time.sleep(delay)
+        else:
+            raise RuntimeError("VLM request failed after retries") from last_error
 
         try:
             return result["choices"][0]["message"]["content"]
@@ -775,6 +836,24 @@ def render_pages(pdf_path: str | Path, page_numbers: list[int], dpi: int = DEFAU
     return rendered
 
 
+def router_request_delay_sec(client: Any) -> float:
+    config = getattr(client, "config", None)
+    raw_value = getattr(config, "router_request_delay_sec", 0.0) if config else 0.0
+    try:
+        return max(0.0, float(raw_value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def extraction_request_delay_sec(client: Any) -> float:
+    config = getattr(client, "config", None)
+    raw_value = getattr(config, "extraction_request_delay_sec", 0.0) if config else 0.0
+    try:
+        return max(0.0, float(raw_value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def route_pdf_pages(
     pdf_path: str | Path,
     *,
@@ -801,7 +880,10 @@ def route_pdf_pages(
         explicit_pages=explicit_pages,
     )
     routed: list[RoutedPage] = []
-    for page_num, image in render_pages(pdf_path, selected_pages, dpi=dpi):
+    delay_sec = router_request_delay_sec(client)
+    for index, (page_num, image) in enumerate(render_pages(pdf_path, selected_pages, dpi=dpi)):
+        if index > 0 and delay_sec > 0:
+            time.sleep(delay_sec)
         category = client.classify_page(image, page_num)
         routed.append(RoutedPage(page_num=page_num, category=category))
     return routed
@@ -833,10 +915,16 @@ def extract_pdf_records(
         explicit_pages=explicit_pages,
     )
     rows: list[dict[str, Any]] = []
-    for page_num, image in render_pages(pdf_path, selected_pages, dpi=dpi):
+    delay_sec = router_request_delay_sec(client)
+    extraction_delay_sec = extraction_request_delay_sec(client)
+    for index, (page_num, image) in enumerate(render_pages(pdf_path, selected_pages, dpi=dpi)):
+        if index > 0 and delay_sec > 0:
+            time.sleep(delay_sec)
         category = client.classify_page(image, page_num)
         if category == "Skip":
             continue
+        if extraction_delay_sec > 0:
+            time.sleep(extraction_delay_sec)
         items = client.extract_page_items(image, category)
         for item in items:
             normalized = normalize_vlm_item(
@@ -875,8 +963,11 @@ def extract_pdf_records_two_phase(
     extraction_targets = [page.page_num for page in routed_pages if page.category != "Skip"]
     category_by_page = {page.page_num: ("Generic" if page.category == "Other" else page.category) for page in routed_pages}
     rows: list[dict[str, Any]] = []
-    for page_num, image in render_pages(pdf_path, extraction_targets, dpi=extraction_dpi):
+    delay_sec = extraction_request_delay_sec(client)
+    for index, (page_num, image) in enumerate(render_pages(pdf_path, extraction_targets, dpi=extraction_dpi)):
         category = category_by_page.get(page_num, "Generic")
+        if index > 0 and delay_sec > 0:
+            time.sleep(delay_sec)
         items = client.extract_page_items(image, category)
         for item in items:
             normalized = normalize_vlm_item(
@@ -1059,6 +1150,11 @@ def build_client_from_args(args: argparse.Namespace) -> OpenAICompatVLMClient:
         extraction_model=args.model or (env_cfg.extraction_model if env_cfg else DEFAULT_EXTRACTION_MODEL),
         router_model=args.router_model or (env_cfg.router_model if env_cfg else DEFAULT_ROUTER_MODEL),
         timeout_sec=args.timeout_sec,
+        router_request_delay_sec=args.router_request_delay_sec,
+        extraction_request_delay_sec=args.extraction_request_delay_sec,
+        request_retries=args.request_retries,
+        retry_backoff_sec=args.retry_backoff_sec,
+        retry_backoff_max_sec=args.retry_backoff_max_sec,
     )
     return OpenAICompatVLMClient(cfg)
 
@@ -1084,6 +1180,11 @@ def main() -> None:
     parser.add_argument("--router-model", default="")
     parser.add_argument("--api-key-env", default="VLM_API_KEY")
     parser.add_argument("--timeout-sec", type=int, default=180)
+    parser.add_argument("--router-request-delay-sec", type=float, default=0.0)
+    parser.add_argument("--extraction-request-delay-sec", type=float, default=0.0)
+    parser.add_argument("--request-retries", type=int, default=2)
+    parser.add_argument("--retry-backoff-sec", type=float, default=1.5)
+    parser.add_argument("--retry-backoff-max-sec", type=float, default=12.0)
     parser.add_argument("--show-status", action="store_true")
     args = parser.parse_args()
 
