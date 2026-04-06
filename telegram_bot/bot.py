@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import queue
 import socket
 import sys
 import threading
@@ -11,6 +12,8 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -121,9 +124,12 @@ class TelegramBotAPI:
         return file_path
 
     def download_file(self, file_path: str, target_path: Path) -> Path:
+        import shutil
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(f"{self.file_base}/{file_path}", timeout=120) as response:
-            target_path.write_bytes(response.read())
+            with target_path.open("wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
         return target_path
 
 
@@ -179,38 +185,6 @@ def _progress_message(stage: str, message: str) -> str:
     return message
 
 
-def _start_progress_heartbeat(
-    api: TelegramBotAPI,
-    chat_id: int,
-    state: dict[str, Any],
-    interval_sec: int,
-) -> tuple[threading.Event, threading.Thread | None]:
-    if interval_sec <= 0:
-        return threading.Event(), None
-
-    stop_event = threading.Event()
-
-    def worker() -> None:
-        while not stop_event.wait(interval_sec):
-            elapsed_sec = int(time.monotonic() - state["started_at"])
-            stage_text = state.get("last_stage_text", "обработка продолжается")
-            elapsed_min = elapsed_sec // 60
-            elapsed_tail = elapsed_sec % 60
-            _safe_notify(
-                api,
-                chat_id,
-                (
-                    "Все еще работаю над файлом.\n"
-                    f"Текущий этап: {stage_text}\n"
-                    f"Прошло: {elapsed_min} мин {elapsed_tail} сек."
-                ),
-            )
-
-    thread = threading.Thread(target=worker, name="snug-bot-heartbeat", daemon=True)
-    thread.start()
-    return stop_event, thread
-
-
 def _support_message() -> str:
     formats = ", ".join(sorted(SUPPORTED_EXTENSIONS))
     return (
@@ -220,7 +194,7 @@ def _support_message() -> str:
     )
 
 
-def _status_message() -> str:
+def _status_env_message() -> str:
     api_key_present = bool(
         os.getenv("VLM_API_KEY", "").strip()
         or os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -237,6 +211,196 @@ def _status_message() -> str:
     )
 
 
+@dataclass
+class JobState:
+    id: str
+    chat_id: int
+    file_name: str
+    suffix: str
+    file_id: str
+    status: str = "queued"
+    stage: str = "queued"
+    stage_text: str = "Ожидает запуска."
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: dict[str, Any] | None = None
+    error: str = ""
+
+
+class JobManager:
+    def __init__(self, api: TelegramBotAPI, base_dir: Path, max_workers: int = 1, history_size: int = 8):
+        self.api = api
+        self.base_dir = base_dir
+        self.max_workers = max(1, max_workers)
+        self.history_size = max(1, history_size)
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._lock = threading.Lock()
+        self._jobs: dict[str, JobState] = {}
+        self._history_by_chat: dict[int, deque[str]] = {}
+        self._workers: list[threading.Thread] = []
+
+        for idx in range(self.max_workers):
+            worker = threading.Thread(target=self._worker, name=f"snug-job-worker-{idx + 1}", daemon=True)
+            worker.start()
+            self._workers.append(worker)
+
+    def submit_document(self, chat_id: int, document: dict[str, Any]) -> JobState:
+        file_name = document.get("file_name") or "upload.bin"
+        suffix = Path(file_name).suffix.lower()
+        job = JobState(
+            id=uuid.uuid4().hex[:8],
+            chat_id=chat_id,
+            file_name=file_name,
+            suffix=suffix,
+            file_id=str(document.get("file_id", "")),
+            created_at=time.monotonic(),
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+            history = self._history_by_chat.setdefault(chat_id, deque(maxlen=self.history_size))
+            history.appendleft(job.id)
+        self._queue.put(job.id)
+        return job
+
+    def get_status_text(self, chat_id: int) -> str:
+        with self._lock:
+            active = [j for j in self._jobs.values() if j.chat_id == chat_id and j.status == "running"]
+            queued = [j for j in self._jobs.values() if j.chat_id == chat_id and j.status == "queued"]
+            history_ids = list(self._history_by_chat.get(chat_id, []))
+            recent_jobs = [self._jobs[job_id] for job_id in history_ids if job_id in self._jobs]
+
+        lines: list[str] = []
+        lines.append(f"Очередь задач: {len(queued)}")
+        lines.append(f"В работе сейчас: {len(active)}")
+
+        if active:
+            current = active[0]
+            elapsed = int(time.monotonic() - (current.started_at or current.created_at))
+            lines.append(
+                f"Текущая задача #{current.id}: {current.file_name} | этап: {current.stage_text} | прошло: {elapsed} сек"
+            )
+        elif queued:
+            next_job = queued[0]
+            lines.append(f"Следующая задача #{next_job.id}: {next_job.file_name}")
+        else:
+            lines.append("Активных задач нет.")
+
+        finished = [j for j in recent_jobs if j.status in {"done", "failed"}]
+        if finished:
+            last = finished[0]
+            if last.status == "done":
+                summary = (last.result or {}).get("summary", {})
+                lines.append(
+                    "Последняя завершенная: "
+                    f"#{last.id} {last.file_name} | rows={summary.get('clean_rows', '?')} | "
+                    f"price_nonzero={summary.get('price_nonzero', '?')}"
+                )
+            else:
+                lines.append(f"Последняя ошибка: #{last.id} {last.file_name} | {last.error or 'unknown error'}")
+
+        return "\n".join(lines)
+
+    def _worker(self) -> None:
+        while True:
+            job_id = self._queue.get()
+            try:
+                self._run_job(job_id)
+            finally:
+                self._queue.task_done()
+
+    def _set_running(self, job: JobState) -> None:
+        with self._lock:
+            job.status = "running"
+            job.stage = "job_prepare"
+            job.stage_text = "Задача запущена."
+            job.started_at = time.monotonic()
+
+    def _set_progress(self, job: JobState, stage: str, message: str) -> None:
+        with self._lock:
+            job.stage = stage
+            job.stage_text = _progress_message(stage, message).replace("\n", " ")
+
+    def _set_done(self, job: JobState, result: dict[str, Any]) -> None:
+        with self._lock:
+            job.status = "done"
+            job.stage = "job_done"
+            job.stage_text = "Обработка завершена."
+            job.result = result
+            job.finished_at = time.monotonic()
+
+    def _set_failed(self, job: JobState, error: str) -> None:
+        with self._lock:
+            job.status = "failed"
+            job.stage = "job_failed"
+            job.stage_text = "Обработка завершилась с ошибкой."
+            job.error = error
+            job.finished_at = time.monotonic()
+
+    def _run_job(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            return
+
+        self._set_running(job)
+        _safe_notify(self.api, job.chat_id, f"Задача #{job.id} принята в работу: {job.file_name}")
+
+        if job.suffix not in SUPPORTED_EXTENSIONS:
+            self._set_failed(job, f"Неподдерживаемый формат: {job.suffix or '<без расширения>'}")
+            _safe_notify(
+                self.api,
+                job.chat_id,
+                f"Задача #{job.id}: формат {job.suffix or '<без расширения>'} не поддерживается. {_support_message()}",
+            )
+            return
+
+        incoming_dir = self.base_dir / "incoming"
+        incoming_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = sanitize_stem(Path(job.file_name).stem)
+        local_input_path = incoming_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}{job.suffix}"
+
+        try:
+            telegram_file_path = self.api.get_file_path(job.file_id)
+            self.api.download_file(telegram_file_path, local_input_path)
+
+            result = process_input_file(
+                local_input_path,
+                output_root=self.base_dir,
+                progress_callback=lambda stage, message: self._set_progress(job, stage, message),
+            )
+            self._set_done(job, result)
+
+            _safe_send_document(
+                self.api,
+                job.chat_id,
+                Path(result["catalog_product_csv"]),
+                caption=_summary_caption(result),
+            )
+
+            archive_path = Path(result["artifacts_zip"])
+            if archive_path.exists():
+                _safe_send_document(
+                    self.api,
+                    job.chat_id,
+                    archive_path,
+                    caption="Архив с промежуточными файлами и summary.",
+                )
+        except ProcessingError as exc:
+            self._set_failed(job, str(exc))
+            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: не удалось обработать файл: {exc}")
+        except Exception as exc:
+            traceback.print_exc()
+            self._set_failed(job, str(exc))
+            _safe_notify(self.api, job.chat_id, f"Задача #{job.id}: во время обработки произошла ошибка: {exc}")
+        finally:
+            try:
+                local_input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _summary_caption(result: dict[str, Any]) -> str:
     summary = result["summary"]
     catalog_path = Path(result["catalog_product_csv"])
@@ -249,18 +413,18 @@ def _summary_caption(result: dict[str, Any]) -> str:
     )
 
 
-def _handle_command(api: TelegramBotAPI, chat_id: int, text: str) -> None:
+def _handle_command(api: TelegramBotAPI, jobs: JobManager, chat_id: int, text: str) -> None:
     command = text.strip().split()[0].lower()
     if command in {"/start", "/help"}:
         api.send_message(chat_id, _support_message())
         return
     if command == "/status":
-        api.send_message(chat_id, _status_message())
+        api.send_message(chat_id, f"{jobs.get_status_text(chat_id)}\n\n{_status_env_message()}")
         return
     api.send_message(chat_id, _support_message())
 
 
-def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]) -> None:
+def _handle_document(api: TelegramBotAPI, jobs: JobManager, chat_id: int, document: dict[str, Any]) -> None:
     file_name = document.get("file_name") or "upload.bin"
     suffix = Path(file_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
@@ -270,58 +434,15 @@ def _handle_document(api: TelegramBotAPI, chat_id: int, document: dict[str, Any]
         )
         return
 
-    base_dir = resolve_data_dir()
-    incoming_dir = base_dir / "incoming"
-    incoming_dir.mkdir(parents=True, exist_ok=True)
-
-    _safe_notify(api, chat_id, f"Файл {file_name} получен. Начинаю обработку.")
-    _safe_notify(api, chat_id, "Скачиваю файл из Telegram в локальную рабочую папку.")
-
-    telegram_file_path = api.get_file_path(document["file_id"])
-    safe_name = sanitize_stem(Path(file_name).stem)
-    local_input_path = incoming_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}{suffix}"
-    api.download_file(telegram_file_path, local_input_path)
-    _safe_notify(api, chat_id, f"Файл скачан: {local_input_path.name}. Передаю его в pipeline.")
-
-    heartbeat_interval_sec = int_from_env("SNUG_BOT_PROGRESS_INTERVAL_SEC", 45)
-    progress_state: dict[str, Any] = {
-        "started_at": time.monotonic(),
-        "last_stage_text": "подготовка обработки",
-    }
-
-    def progress_callback(stage: str, message: str) -> None:
-        formatted = _progress_message(stage, message)
-        progress_state["last_stage_text"] = formatted.replace("\n", " ")
-        _safe_notify(api, chat_id, formatted)
-
-    stop_event, heartbeat_thread = _start_progress_heartbeat(
+    job = jobs.submit_document(chat_id, document)
+    _safe_notify(
         api,
         chat_id,
-        progress_state,
-        heartbeat_interval_sec,
+        f"Файл {file_name} принят. Создал задачу #{job.id}. Проверяйте прогресс командой /status.",
     )
 
-    try:
-        result = process_input_file(
-            local_input_path,
-            output_root=base_dir,
-            progress_callback=progress_callback,
-        )
-    finally:
-        stop_event.set()
-        if heartbeat_thread is not None:
-            heartbeat_thread.join(timeout=1)
 
-    _safe_notify(api, chat_id, "Отправляю готовый catalog_product.csv.")
-    _safe_send_document(api, chat_id, Path(result["catalog_product_csv"]), caption=_summary_caption(result))
-
-    archive_path = Path(result["artifacts_zip"])
-    if archive_path.exists():
-        _safe_notify(api, chat_id, "Отправляю архив с промежуточными файлами и summary.")
-        _safe_send_document(api, chat_id, archive_path, caption="Дополнительно отправляю архив со всеми артефактами обработки.")
-
-
-def handle_update(api: TelegramBotAPI, update: dict[str, Any]) -> None:
+def handle_update(api: TelegramBotAPI, jobs: JobManager, update: dict[str, Any]) -> None:
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -330,13 +451,13 @@ def handle_update(api: TelegramBotAPI, update: dict[str, Any]) -> None:
 
     text = message.get("text", "")
     if text.startswith("/"):
-        _handle_command(api, chat_id, text)
+        _handle_command(api, jobs, chat_id, text)
         return
 
     document = message.get("document")
     if document:
         try:
-            _handle_document(api, chat_id, document)
+            _handle_document(api, jobs, chat_id, document)
         except ProcessingError as exc:
             _safe_notify(api, chat_id, f"Не удалось обработать файл: {exc}")
         except Exception as exc:
@@ -355,7 +476,10 @@ def main() -> None:
 
     poll_timeout = int_from_env("SNUG_BOT_POLL_TIMEOUT", 30)
     retry_delay_sec = int_from_env("SNUG_BOT_RETRY_DELAY_SEC", 5)
+    max_workers = int_from_env("SNUG_BOT_MAX_WORKERS", 1)
     api = TelegramBotAPI(token)
+    base_dir = resolve_data_dir()
+    jobs = JobManager(api, base_dir=base_dir, max_workers=max_workers)
     offset: int | None = None
 
     print("SNUG Telegram bot started. Waiting for files...")
@@ -364,7 +488,7 @@ def main() -> None:
             updates = api.get_updates(offset=offset, timeout=poll_timeout)
             for update in updates:
                 offset = int(update["update_id"]) + 1
-                handle_update(api, update)
+                handle_update(api, jobs, update)
         except NETWORK_ERROR_TYPES as exc:
             print(_format_network_error(exc))
             time.sleep(retry_delay_sec)

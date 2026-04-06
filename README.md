@@ -86,7 +86,7 @@ OPENROUTER_API_KEY=...
 SNUG_BOT_DATA_DIR=/app/data
 SNUG_BOT_POLL_TIMEOUT=30
 SNUG_BOT_RETRY_DELAY_SEC=5
-SNUG_BOT_PROGRESS_INTERVAL_SEC=45
+SNUG_BOT_MAX_WORKERS=1
 SNUG_PIPELINE_TWO_PHASE=1
 SNUG_PIPELINE_PAGE_STRATEGY=all
 SNUG_PIPELINE_ROUTING_STRATEGY=all
@@ -98,6 +98,12 @@ VLM_BASE_URL=https://openrouter.ai/api/v1
 VLM_MODEL=qwen/qwen3-vl-235b-a22b-instruct
 VLM_ROUTER_MODEL=x-ai/grok-4.1-fast
 ```
+
+## Режим для 1 GB RAM
+
+- Ставьте `SNUG_BOT_MAX_WORKERS=1`, чтобы обрабатывать строго по одной задаче.
+- Бот теперь не шлет постоянные progress-сообщения во время долгой обработки.
+- После отправки файла бот создаёт задачу и сообщает её номер, а статус проверяется командой `/status`.
 
 ## Безопасность
 

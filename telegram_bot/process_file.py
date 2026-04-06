@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import zipfile
 from datetime import datetime
@@ -59,7 +60,8 @@ def _job_dir_for(input_path: Path, output_root: Path) -> Path:
 def _copy_to_job_input(source_path: Path, input_dir: Path) -> Path:
     input_dir.mkdir(parents=True, exist_ok=True)
     target_path = input_dir / source_path.name
-    target_path.write_bytes(source_path.read_bytes())
+    with source_path.open("rb") as src, target_path.open("wb") as dst:
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
     return target_path
 
 
